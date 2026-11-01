@@ -12,7 +12,7 @@ try:
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
 
@@ -234,6 +234,8 @@ class BilibiliAdapter(BaseAdapter):
         self.logger.info(
             f"Bilibili 适配器已启动，共 {len(self._account_tasks)} 个账户"
         )
+        # 扫码端点必须随 start 注册（面板扫码依赖 /bilibili/qr/*）
+        self._ensure_qr_routes()
         self._setup_dashboard_section()
 
     async def _run_account(self, rt: "_AccountRuntime"):
