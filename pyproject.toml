@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ErisPulse-BilibiliAdapter"
-version = "0.1.2"
+version = "0.1.10"
 description = "ErisPulse Bilibili 私信适配器 — Cookie/扫码双登录、事件驱动收发、多账户"
 readme = "README.md"
 license = { text = "MIT" }

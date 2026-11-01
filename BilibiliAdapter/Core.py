@@ -12,7 +12,7 @@ try:
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "0.1.2"
+__version__ = "0.1.10"
 
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
 
@@ -52,7 +52,7 @@ def _check_framework_version() -> bool:
         return True
 
 
-from bilibili_api import login_v2, session as bili_session
+from bilibili_api import session as bili_session
 from bilibili_api.utils.network import Credential
 
 
@@ -206,6 +206,13 @@ class BilibiliAdapter(BaseAdapter):
     # ==================== 生命周期 ====================
 
     async def start(self):
+        # 扫码端点随 start 无条件注册（reload 后路由会被框架清理，必须重注册）
+        try:
+            self._ensure_qr_routes()
+        except Exception as e:
+            self.logger.error(f"扫码路由注册异常: {e}")
+        self._setup_dashboard_section()
+
         for name, account in self.enabled_accounts.items():
             credential = self._build_credential(account)
             if credential is None:
@@ -552,48 +559,65 @@ class BilibiliAdapter(BaseAdapter):
             pass
 
     def _ensure_qr_routes(self):
-        """扫码端点注册（幂等）"""
-        if getattr(self, "_qr_routes_ready", False):
-            return
+        """扫码端点注册（幂等：先注销再注册，防配置热重载后路由被清而标志残留）"""
         from ErisPulse.Core import router
 
+        try:
+            router.unregister_http_route("bilibili", "/qr/start")
+            router.unregister_http_route("bilibili", "/qr/poll")
+        except Exception:
+            pass
         self._qr_sessions: Dict[str, Any] = {}
 
         async def _qr_start(request):
             from fastapi.responses import JSONResponse
-
-            qrl = login_v2.QrCodeLogin(login_v2.QrCodeLoginChannel.WEB)
-            await qrl.generate_qrcode()
-            pic = qrl.get_qrcode_picture()
-            # Picture.url 可能是本地临时文件路径（file://），浏览器无法加载——转 data URL
-            qr_img = ""
-            try:
-                content = pic.content
-                if not content and pic.url and pic.url.startswith("file://"):
-                    import pathlib as _pathlib
-
-                    content = _pathlib.Path(pic.url[7:]).read_bytes()
-                if content:
-                    import base64 as _b64
-
-                    mime = "image/png" if pic.imageType != "svg" else "image/svg+xml"
-                    qr_img = f"data:{mime};base64," + _b64.b64encode(content).decode()
-                elif pic.url and not pic.url.startswith("file://"):
-                    qr_img = pic.url
-            except Exception:
-                qr_img = pic.url if pic.url and not pic.url.startswith("file://") else ""
             import secrets as _secrets
+            import qrcode as _qrcode
 
+            resp = await client.get(
+                "https://passport.bilibili.com/x/passport-login/web/qrcode/generate",
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', 'Referer': 'https://passport.bilibili.com/'},
+                timeout=15,
+            )
+            if resp.status != 200:
+                body = await resp.text()
+                self.logger.error(f"二维码生成被拒: HTTP {resp.status} {body[:150]}")
+                return JSONResponse({"success": False, "error": f"B 站风控拦截 (HTTP {resp.status})，请稍后重试"}, status_code=502)
+            try:
+                result = await resp.json()
+            except Exception:
+                body = await resp.text()
+                self.logger.error(f"二维码生成响应非 JSON: {body[:150]}")
+                return JSONResponse({"success": False, "error": "B 站返回异常响应"}, status_code=502)
+            if (result or {}).get("code") != 0:
+                return JSONResponse({"success": False, "error": f"生成二维码失败: {result}"}, status_code=502)
+            data = result.get("data") or {}
+            qrcode_key = str(data.get("qrcode_key") or "")
+            qr_url = str(data.get("url") or "")
+            if not qrcode_key or not qr_url:
+                return JSONResponse({"success": False, "error": "缺少 qrcode_key"}, status_code=502)
+
+            qr = _qrcode.QRCode(border=2, error_correction=_qrcode.constants.ERROR_CORRECT_M)
+            qr.add_data(qr_url)
+            qr.make(fit=True)
+            matrix = qr.get_matrix()
+            n = len(matrix)
+            parts = [f"M{x} {y}h1v1h-1z" for y, row in enumerate(matrix) for x, on in enumerate(row) if on]
+            svg = (
+                f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {n} {n}" '
+                f'shape-rendering="crispEdges" width="240" height="240">'
+                f'<rect width="{n}" height="{n}" fill="#fff"/>'
+                f'<path d="{"".join(parts)}" fill="#111"/></svg>'
+            )
             poll_token = _secrets.token_urlsafe(24)
-            task_id = uuid.uuid4().hex
-            self._qr_sessions[task_id] = {"qrl": qrl, "token": poll_token}
+            self._qr_sessions[qrcode_key] = {"token": poll_token}
             return JSONResponse(
                 {
                     "success": True,
-                    "task_id": task_id,
+                    "task_id": qrcode_key,
                     "poll_token": poll_token,
-                    "qr_img": qr_img,
-                    "qr_url": pic.url if not pic.url.startswith("file://") else "",
+                    "qr_img": f"data:image/svg+xml;base64,"
+                    + __import__("base64").b64encode(svg.encode()).decode(),
                 }
             )
 
@@ -605,53 +629,86 @@ class BilibiliAdapter(BaseAdapter):
                 body = await request.json()
             except Exception:
                 pass
-            task_id = str(body.get("task_id") or "")
+            qrcode_key = str(body.get("task_id") or "")
             token = str(body.get("poll_token") or "")
-            entry = self._qr_sessions.get(task_id)
+            entry = self._qr_sessions.get(qrcode_key)
             if not entry or entry["token"] != token:
                 return JSONResponse({"success": False, "error": "unauthorized"}, status_code=403)
-            qrl = entry["qrl"]
-            try:
-                state = await qrl.check_state()
-            except Exception as e:
-                return JSONResponse({"success": False, "error": str(e)}, status_code=500)
-            out = {"success": True, "status": str(state.value) if hasattr(state, "value") else str(state)}
-            if state == login_v2.QrCodeLoginEvents.DONE:
-                cred = await qrl.get_credential()
-                from ErisPulse.Core import config as _cfg
 
+            resp = await client.get(
+                "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+                params={"qrcode_key": qrcode_key},
+                headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36', 'Referer': 'https://passport.bilibili.com/'},
+                timeout=15,
+            )
+            if resp.status != 200:
+                body = await resp.text()
+                self.logger.error(f"扫码轮询被拒: HTTP {resp.status} {body[:150]}")
+                return JSONResponse({"success": False, "error": f"B 站风控拦截 (HTTP {resp.status})"}, status_code=502)
+            try:
+                result = await resp.json()
+            except Exception:
+                body = await resp.text()
+                self.logger.error(f"扫码轮询响应非 JSON: {body[:150]}")
+                return JSONResponse({"success": False, "error": "B 站返回异常响应"}, status_code=502)
+            if (result or {}).get("code") not in (0, 86038, 86090, 86101):
+                return JSONResponse({"success": False, "error": f"轮询异常: {result}"}, status_code=502)
+            data = result.get("data") or {}
+            code = int(data.get("code") or result.get("code") or 0)
+
+            # 86101=未扫码 86090=已扫待确认 86038=已过期 0=成功
+            status = {0: "done", 86090: "scan", 86101: "pending", 86038: "timeout"}.get(code, "pending")
+            out = {"success": True, "status": status}
+            if code == 0:
+                # data.url 携带登录 cookie：...?SESSDATA=...&bili_jct=...&DedeUserID=...
+                from urllib.parse import urlparse, parse_qs
+
+                cookies = parse_qs(urlparse(str(data.get("url") or "")).query)
+                sessdata = (cookies.get("SESSDATA") or [""])[0]
+                bili_jct = (cookies.get("bili_jct") or [""])[0]
+                dedeuserid = (cookies.get("DedeUserID") or [""])[0]
+                if not sessdata or not bili_jct:
+                    self.logger.error(f"扫码成功但 cookie 解析为空: {data.get('url', '')[:120]}")
+                    self._qr_sessions.pop(qrcode_key, None)
+                    return JSONResponse(
+                        {"success": False, "error": "扫码成功但 cookie 解析为空"}, status_code=500
+                    )
+                from ErisPulse.Core import config as _cfg
+                from bilibili_api.utils.network import Credential
+
+                credential = Credential(
+                    sessdata=sessdata, bili_jct=bili_jct, dedeuserid=dedeuserid or None,
+                    ac_time_value=str(data.get("refresh_token") or "") or None,
+                )
                 key = "BilibiliAdapter.accounts"
-                data = _cfg.getConfig(key) or {}
-                if not isinstance(data, dict):
-                    data = {}
-                dft = data.get("default")
+                accounts = _cfg.getConfig(key) or {}
+                if not isinstance(accounts, dict):
+                    accounts = {}
+                dft = accounts.get("default")
                 if isinstance(dft, dict) and not dft.get("sessdata"):
                     name = "default"
                 else:
-                    base, i, name = "qr", 1, "qr"
-                    while name in data and data[name].get("sessdata"):
-                        i += 1
-                        name = f"{base}{i}"
-                data[name] = {
+                    base, i2, name = "qr", 1, "qr"
+                    while name in accounts and accounts[name].get("sessdata"):
+                        i2 += 1
+                        name = f"{base}{i2}"
+                accounts[name] = {
                     "login_mode": "qrcode",
-                    "sessdata": cred.sessdata or "",
-                    "bili_jct": cred.bili_jct or "",
-                    "buvid3": cred.buvid3 or "",
-                    "dedeuserid": cred.dedeuserid or "",
-                    "bot_id": cred.dedeuserid or "",
+                    "sessdata": sessdata,
+                    "bili_jct": bili_jct,
+                    "buvid3": "",
+                    "dedeuserid": dedeuserid,
+                    "bot_id": dedeuserid,
                     "enabled": True,
                 }
-                _cfg.setConfig(key, data)
-                self._qr_sessions.pop(task_id, None)
+                _cfg.setConfig(key, accounts)
+                self._qr_sessions.pop(qrcode_key, None)
                 out["account"] = name
                 self.logger.info(f"扫码登录完成，凭据已写入账户 {name}")
-            elif state == login_v2.QrCodeLoginEvents.TIMEOUT:
-                self._qr_sessions.pop(task_id, None)
+            elif code == 86038:
+                self._qr_sessions.pop(qrcode_key, None)
             return JSONResponse(out)
 
-        router.register_http_route("bilibili", "/qr/start", _qr_start, methods=["POST"])
-        router.register_http_route("bilibili", "/qr/poll", _qr_poll, methods=["POST"])
-        self._qr_routes_ready = True
         self.logger.debug("扫码登录端点已注册 (/bilibili/qr/*)")
 
     @staticmethod
@@ -672,49 +729,61 @@ button{padding:8px 18px;border-radius:10px;border:1px solid rgba(128,128,128,.4)
 <button id="re" style="display:none" onclick="location.reload()">重新获取</button>
 <script>
 (async function(){
+  var st = document.getElementById("st"), re = document.getElementById("re");
   var startResp = null;
+  // 获取二维码（适配器热重载窗口内 404 自动重试）
   for (var attempt = 0; attempt < 6; attempt++) {
     try {
       var rr = await fetch("/bilibili/qr/start", {method:"POST"});
-      if (rr.status === 404) { throw {retry: true, msg: "适配器重启中"}; }
+      if (rr.status === 404) { throw {retry: true}; }
       startResp = await rr.json();
       break;
     } catch (e) {
-      if (attempt === 5) { throw new Error(e.msg || e.message || "start failed"); }
-      document.getElementById("st").textContent = "适配器重启中，" + (5 - attempt) + " 秒后重试…";
+      if (attempt === 5) {
+        st.textContent = "获取二维码失败: " + (e.msg || e.message || "start failed");
+        re.style.display = "";
+        return;
+      }
+      st.textContent = "适配器重启中，" + (5 - attempt) + " 秒后重试…";
       await new Promise(function(res){ setTimeout(res, 2000); });
     }
   }
   var d = startResp;
-  if(!d || !d.success) throw new Error((d && d.error) || "start failed");
-    if (d.qr_img) { document.getElementById("qr").innerHTML = '<img src="' + d.qr_img + '" alt="QR">'; }
-    else { document.getElementById("st").textContent = "二维码获取异常，请重试"; }
-    document.getElementById("st").textContent = "请使用 B 站 APP 扫码并确认登录";
-    var taskId = d.task_id, token = d.poll_token, n = 0;
-    var timer = setInterval(async function(){
-      n++;
-      if(n > 90){ clearInterval(timer); document.getElementById("st").textContent="二维码已过期"; document.getElementById("re").style.display=""; return; }
-      try{
-        var pr = await fetch("/bilibili/qr/poll", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({task_id:taskId, poll_token:token})});
-        var pd = await pr.json();
-        if(pd.success && pd.status === "done"){
-          clearInterval(timer);
-          document.getElementById("st").className = "st ok";
-          document.getElementById("st").textContent = "登录成功，凭据已写入账户 " + (pd.account || "");
-          setTimeout(function(){ parent.postMessage({type:"ep_section_done", success:true}, "*"); }, 900);
-        } else if(pd.success && pd.status === "timeout"){
-          clearInterval(timer);
-          document.getElementById("st").textContent = "二维码已过期";
-          document.getElementById("re").style.display="";
-        } else if(pd.success && pd.status === "scan"){
-          document.getElementById("st").textContent = "已扫码，请在手机上确认";
-        }
-      }catch(e){}
-    }, 2000);
-  }catch(e){
-    document.getElementById("st").textContent = "获取二维码失败: " + e.message;
-    document.getElementById("re").style.display="";
+  if (!d || !d.success) {
+    st.textContent = "获取二维码失败";
+    re.style.display = "";
+    return;
   }
+  if (d.qr_img) {
+    document.getElementById("qr").innerHTML = '<img src="' + d.qr_img + '" alt="QR">';
+  }
+  st.textContent = "请使用 B 站 APP 扫码并确认登录";
+  var taskId = d.task_id, token = d.poll_token, n = 0;
+  var timer = setInterval(async function(){
+    n++;
+    if(n > 90){
+      clearInterval(timer);
+      st.textContent = "二维码已过期";
+      re.style.display = "";
+      return;
+    }
+    try{
+      var pr = await fetch("/bilibili/qr/poll", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({task_id:taskId, poll_token:token})});
+      var pd = await pr.json();
+      if(pd.success && pd.status === "done"){
+        clearInterval(timer);
+        st.className = "st ok";
+        st.textContent = "登录成功，凭据已写入账户 " + (pd.account || "");
+        setTimeout(function(){ parent.postMessage({type:"ep_section_done", success:true}, "*"); }, 900);
+      } else if(pd.success && pd.status === "timeout"){
+        clearInterval(timer);
+        st.textContent = "二维码已过期";
+        re.style.display = "";
+      } else if(pd.success && pd.status === "scan"){
+        st.textContent = "已扫码，请在手机上确认";
+      }
+    }catch(e){}
+  }, 2000);
 })();
 </script></body></html>'''
 
