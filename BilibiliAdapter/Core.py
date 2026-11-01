@@ -12,7 +12,7 @@ try:
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
 
@@ -210,8 +210,8 @@ class BilibiliAdapter(BaseAdapter):
             credential = self._build_credential(account)
             if credential is None:
                 self.logger.warning(
-                    f"账户 {name} 缺少登录凭据（cookie 模式需 sessdata+bili_jct；"
-                    "qrcode 模式请在面板扫码登录）"
+                    f"账户 {name} 缺少登录凭据——请在面板「添加账户向导」中扫码登录，"
+                    "或填写 Cookie 凭据后保存"
                 )
                 continue
 
@@ -565,6 +565,23 @@ class BilibiliAdapter(BaseAdapter):
             qrl = login_v2.QrCodeLogin(login_v2.QrCodeLoginChannel.WEB)
             await qrl.generate_qrcode()
             pic = qrl.get_qrcode_picture()
+            # Picture.url 可能是本地临时文件路径（file://），浏览器无法加载——转 data URL
+            qr_img = ""
+            try:
+                content = pic.content
+                if not content and pic.url and pic.url.startswith("file://"):
+                    import pathlib as _pathlib
+
+                    content = _pathlib.Path(pic.url[7:]).read_bytes()
+                if content:
+                    import base64 as _b64
+
+                    mime = "image/png" if pic.imageType != "svg" else "image/svg+xml"
+                    qr_img = f"data:{mime};base64," + _b64.b64encode(content).decode()
+                elif pic.url and not pic.url.startswith("file://"):
+                    qr_img = pic.url
+            except Exception:
+                qr_img = pic.url if pic.url and not pic.url.startswith("file://") else ""
             import secrets as _secrets
 
             poll_token = _secrets.token_urlsafe(24)
@@ -575,7 +592,8 @@ class BilibiliAdapter(BaseAdapter):
                     "success": True,
                     "task_id": task_id,
                     "poll_token": poll_token,
-                    "qr_url": pic.url or "",
+                    "qr_img": qr_img,
+                    "qr_url": pic.url if not pic.url.startswith("file://") else "",
                 }
             )
 
@@ -654,11 +672,23 @@ button{padding:8px 18px;border-radius:10px;border:1px solid rgba(128,128,128,.4)
 <button id="re" style="display:none" onclick="location.reload()">重新获取</button>
 <script>
 (async function(){
-  try{
-    var r = await fetch("/bilibili/qr/start", {method:"POST"});
-    var d = await r.json();
-    if(!d.success) throw new Error(d.error || "start failed");
-    document.getElementById("qr").innerHTML = '<img src="' + d.qr_url + '" alt="QR">';
+  var startResp = null;
+  for (var attempt = 0; attempt < 6; attempt++) {
+    try {
+      var rr = await fetch("/bilibili/qr/start", {method:"POST"});
+      if (rr.status === 404) { throw {retry: true, msg: "适配器重启中"}; }
+      startResp = await rr.json();
+      break;
+    } catch (e) {
+      if (attempt === 5) { throw new Error(e.msg || e.message || "start failed"); }
+      document.getElementById("st").textContent = "适配器重启中，" + (5 - attempt) + " 秒后重试…";
+      await new Promise(function(res){ setTimeout(res, 2000); });
+    }
+  }
+  var d = startResp;
+  if(!d || !d.success) throw new Error((d && d.error) || "start failed");
+    if (d.qr_img) { document.getElementById("qr").innerHTML = '<img src="' + d.qr_img + '" alt="QR">'; }
+    else { document.getElementById("st").textContent = "二维码获取异常，请重试"; }
     document.getElementById("st").textContent = "请使用 B 站 APP 扫码并确认登录";
     var taskId = d.task_id, token = d.poll_token, n = 0;
     var timer = setInterval(async function(){
