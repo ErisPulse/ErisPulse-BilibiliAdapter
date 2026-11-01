@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ErisPulse-BilibiliAdapter"
+version = "0.2.0"
+description = "ErisPulse Bilibili 私信适配器 — Cookie/扫码双登录、事件驱动收发、多账户"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [ { name = "wsu2059", email = "wsu2059@qq.com" } ]
+requires-python = ">=3.10"
+dependencies = [
+    "bilibili-api-python>=16.3.0",
+    "qrcode>=7.4",
+]
+
+[project.urls]
+"homepage" = "https://github.com/ErisPulse/ErisPulse-BilibiliAdapter"
+
+[project.entry-points."erispulse.adapter"]
+bilibili = "BilibiliAdapter:BilibiliAdapter"
+
+[tool.setuptools.packages.find]
+include = ["BilibiliAdapter"]
