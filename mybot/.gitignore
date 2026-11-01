@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# 虚拟环境与本地环境
+.venv/
+venv/
+env/
+.env
+
+# 工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# ErisPulse 运行时数据（配置与日志含敏感信息，不入库）
+config/
+logs/
+
+# 编辑器与系统文件
+.idea/
+.vscode/
+*.swp
+.DS_Store

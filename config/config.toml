@@ -1,0 +1,29 @@
+[ErisPulse.modules.status]
+ASCIICat = true
+CardForge = true
+ConnHub = true
+Cron = true
+DailyCard = true
+Dashboard = true
+GovReport = true
+NekoCare = true
+QQGroupAdmin = true
+QvQChat = true
+Reminder = true
+RichBridge = true
+Schedule = true
+ShadowOps = true
+SqlManager = true
+Takumi = true
+
+[ErisPulse.adapters.status]
+bilibili = true
+[BilibiliAdapter.accounts.1]
+name = "12312"
+login_mode = "qrcode"
+sessdata = "12312321312"
+bili_jct = "213421321321321"
+buvid3 = "21321412"
+dedeuserid = "3123"
+bot_id = "213"
+enabled = false

@@ -12,7 +12,7 @@ try:
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "0.1.10"
+__version__ = "0.1.12"
 
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
 
@@ -211,7 +211,10 @@ class BilibiliAdapter(BaseAdapter):
             self._ensure_qr_routes()
         except Exception as e:
             self.logger.error(f"扫码路由注册异常: {e}")
-        self._setup_dashboard_section()
+        try:
+            self._setup_dashboard_section()
+        except Exception as e:
+            self.logger.debug(f"面板扩展区注册跳过（Dashboard 未加载，加载后会自动补注册）: {e}")
 
         for name, account in self.enabled_accounts.items():
             credential = self._build_credential(account)
@@ -553,8 +556,17 @@ class BilibiliAdapter(BaseAdapter):
                 _register()
                 sdk.lifecycle.unregister("module.load", _on_module_load)
 
+        async def _on_init_complete(data):
+            # 初始化完成后 Dashboard 若已加载（适配器先于模块启动的时序），补注册
+            _register()
+            try:
+                sdk.lifecycle.unregister("core.init.complete", _on_init_complete)
+            except Exception:
+                pass
+
         try:
             sdk.lifecycle.register("module.load", _on_module_load)
+            sdk.lifecycle.register("core.init.complete", _on_init_complete)
         except Exception:
             pass
 
@@ -660,18 +672,37 @@ class BilibiliAdapter(BaseAdapter):
             status = {0: "done", 86090: "scan", 86101: "pending", 86038: "timeout"}.get(code, "pending")
             out = {"success": True, "status": status}
             if code == 0:
-                # data.url 携带登录 cookie：...?SESSDATA=...&bili_jct=...&DedeUserID=...
-                from urllib.parse import urlparse, parse_qs
-
-                cookies = parse_qs(urlparse(str(data.get("url") or "")).query)
-                sessdata = (cookies.get("SESSDATA") or [""])[0]
-                bili_jct = (cookies.get("bili_jct") or [""])[0]
-                dedeuserid = (cookies.get("DedeUserID") or [""])[0]
+                # B 站新协议：data.url 为 crossDomain ticket 跳转，cookie 在跳转响应的 Set-Cookie 里
+                cross_url = str(data.get("url") or "")
+                sessdata = bili_jct = dedeuserid = ""
+                UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                hop_url = cross_url
+                for _hop in range(6):
+                    hop_resp = await client.get(
+                        hop_url,
+                        headers={"User-Agent": UA, "Referer": "https://www.bilibili.com/"},
+                        timeout=15,
+                        allow_redirects=False,
+                    )
+                    for cookie_header in hop_resp.headers.getall("Set-Cookie", []):
+                        pair = cookie_header.split(";", 1)[0]
+                        if "=" in pair:
+                            k, v = pair.split("=", 1)
+                            if k == "SESSDATA" and v:
+                                sessdata = v
+                            elif k == "bili_jct" and v:
+                                bili_jct = v
+                            elif k == "DedeUserID" and v:
+                                dedeuserid = v
+                    next_url = hop_resp.headers.get("Location")
+                    if not next_url:
+                        break
+                    hop_url = next_url
                 if not sessdata or not bili_jct:
-                    self.logger.error(f"扫码成功但 cookie 解析为空: {data.get('url', '')[:120]}")
+                    self.logger.error(f"扫码成功但凭据提取为空（crossDomain: {cross_url[:120]}）")
                     self._qr_sessions.pop(qrcode_key, None)
                     return JSONResponse(
-                        {"success": False, "error": "扫码成功但 cookie 解析为空"}, status_code=500
+                        {"success": False, "error": "扫码成功但凭据提取为空，请重试或使用 Cookie 模式"}, status_code=500
                     )
                 from ErisPulse.Core import config as _cfg
                 from bilibili_api.utils.network import Credential

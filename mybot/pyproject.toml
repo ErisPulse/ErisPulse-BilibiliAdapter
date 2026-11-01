@@ -1,0 +1,8 @@
+[project]
+name = "mybot"
+version = "0.1.0"
+description = "ErisPulse project"
+requires-python = ">=3.10"
+dependencies = [
+    "erispulse>=2.9.0",
+]
