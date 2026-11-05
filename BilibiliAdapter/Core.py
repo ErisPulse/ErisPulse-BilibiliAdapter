@@ -1,18 +1,21 @@
 import asyncio
 import json
+import re
 import time as _time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote
 
 from ErisPulse import sdk
+from ErisPulse.Core import client
 from ErisPulse.Core.Bases import BaseConfig, BotAccountConfig, BaseAdapter
 try:
     from ErisPulse.runtime.tasks import spawn_background
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "0.1.12"
+__version__ = "0.2.1"
 
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
 
@@ -54,6 +57,41 @@ def _check_framework_version() -> bool:
 
 from bilibili_api import session as bili_session
 from bilibili_api.utils.network import Credential
+
+
+def _forward_node_text(node: Dict) -> str:
+    """提取合并转发节点 content 中全部 text 段文本（段间直接连接）"""
+    data = node.get("data") or {}
+    return "".join(
+        str(seg.get("data", {}).get("text") or "")
+        for seg in (data.get("content") or [])
+        if isinstance(seg, dict) and seg.get("type") == "text"
+    )
+
+
+def _forward_nodes_plain(nodes, separator: str = "\n") -> str:
+    """合并转发节点降级纯文本：每条「昵称: 正文」"""
+    lines = []
+    for node in nodes if isinstance(nodes, list) else [nodes]:
+        if not isinstance(node, dict):
+            continue
+        data = node.get("data") or {}
+        nickname = str(data.get("nickname") or "").strip()
+        text = _forward_node_text(node).strip()
+        if nickname and text:
+            lines.append(f"{nickname}: {text}")
+        elif text:
+            lines.append(text)
+    return separator.join(lines)
+
+
+def _strip_file_scheme(path: str) -> str:
+    """剥除 file:// 前缀并解码百分号编码（file:///D:/a%20b.png → D:/a b.png）"""
+    if path.startswith("file://"):
+        path = unquote(path[len("file://"):])
+        if re.match(r"^/[A-Za-z]:", path):
+            path = path[1:]
+    return path
 
 
 @dataclass
@@ -393,10 +431,51 @@ class BilibiliAdapter(BaseAdapter):
         msg_key = ((result or {}).get("data") or {}).get("msg_key", "")
         return self.make_response(data=result, message_id=str(msg_key), raw=result)
 
+    @staticmethod
+    def _detect_image_format(data: bytes) -> str:
+        """按文件头魔数判断图片格式（png/jpg/gif/webp），未识别时返回 png"""
+        if len(data) < 12:
+            return "png"
+        h = data[:16]
+        if h[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if h[:2] == b"\xff\xd8":
+            return "jpg"
+        if h[:6] in (b"GIF87a", b"GIF89a"):
+            return "gif"
+        if h[:4] == b"RIFF" and h[8:12] == b"WEBP":
+            return "webp"
+        return "png"
+
+    async def _download_image(self, url: str) -> tuple:
+        """下载 URL 图片为 (bytes, 失败原因)，成功时失败原因为 None"""
+        try:
+            resp = await client.get(url, timeout=30)
+            status = getattr(resp, "status", 0)
+            if status >= 400:
+                return None, f"HTTP {status}"
+            return await resp.read(), None
+        except Exception as e:
+            return None, str(e)
+
     async def _send_picture(self, rt: "_AccountRuntime", receiver_id: str, file_ref) -> dict:
         from bilibili_api.utils.picture import Picture
 
-        pic = Picture(url=file_ref) if str(file_ref).startswith(("http://", "https://")) else Picture.from_file(str(file_ref))
+        if isinstance(file_ref, bytes):
+            pic = Picture.from_content(file_ref, self._detect_image_format(file_ref))
+        else:
+            source = _strip_file_scheme(str(file_ref))
+            if source.startswith(("http://", "https://")):
+                # B 站私信图片要求自有图床内容：下载后经 from_content（url 为 bytes://）触发上传
+                content, reason = await self._download_image(source)
+                if content is None:
+                    return self.make_error(
+                        retcode=10002,
+                        message=f"图片下载失败: {source} ({reason})",
+                    )
+                pic = Picture.from_content(content, self._detect_image_format(content))
+            else:
+                pic = Picture.from_file(source)
         result = await bili_session.send_msg(
             rt.credential, int(receiver_id), bili_session.EventType.PICTURE, pic
         )
@@ -423,30 +502,70 @@ class BilibiliAdapter(BaseAdapter):
                 if not target_id:
                     return adapter.make_error(retcode=10003, message="无法确定发送目标（需要 To('user', <uid>)）")
 
-                texts, pictures, unsupported = [], [], []
-                for seg in self._apply_modifiers(message):
+                segments = self._apply_modifiers(message)
+
+                # 纯 node 列表：合并转发降级为「昵称: 正文」逐行纯文本
+                if segments and all(
+                    isinstance(seg, dict) and seg.get("type") == "node"
+                    for seg in segments
+                ):
+                    node_text = _forward_nodes_plain(segments)
+                    if not node_text:
+                        return adapter.make_error(retcode=10002, message="node 段无有效文本内容")
+                    return await adapter._send_text(rt, target_id, node_text)
+
+                unsupported = []
+                result = None
+                sent = False
+                pending_text = []
+
+                async def _flush_text():
+                    nonlocal result, sent
+                    text = "".join(pending_text)
+                    pending_text.clear()
+                    if text:
+                        result = await adapter._send_text(rt, target_id, text)
+                        sent = True
+
+                for seg in segments:
                     stype = seg.get("type")
                     data = seg.get("data", {}) or {}
                     if stype == "text":
-                        texts.append(str(data.get("text", "")))
+                        pending_text.append(str(data.get("text", "")))
+                    elif stype == "node":
+                        node_text = _forward_nodes_plain(seg)
+                        if node_text:
+                            pending_text.append(node_text + "\n")
                     elif stype == "image":
-                        pictures.append(data.get("file"))
+                        await _flush_text()
+                        pic = data.get("file")
+                        if pic:
+                            result = await adapter._send_picture(rt, target_id, pic)
+                            sent = True
                     elif stype == "reply":
-                        continue
+                        adapter.logger.warning(
+                            f"B 站私信不支持 reply 段，已忽略（message_id={data.get('message_id', '')}）"
+                        )
                     else:
-                        unsupported.append(stype)
+                        unsupported.append(str(stype))
 
-                result = None
-                if texts:
-                    result = await adapter._send_text(rt, target_id, "".join(texts))
-                for pic in pictures:
-                    result = await adapter._send_picture(rt, target_id, pic)
-                if not texts and not pictures:
+                await _flush_text()
+
+                if not sent:
                     return adapter.make_error(
                         retcode=10002,
                         message="B 站私信仅支持 text/image 段"
                         + (f"，收到不支持段: {unsupported}" if unsupported else "，且消息为空"),
                     )
+                if unsupported:
+                    adapter.logger.warning(
+                        f"B 站私信发送已跳过不支持的段: {', '.join(unsupported)}"
+                    )
+                    if result is not None:
+                        note = f"已跳过不支持的段: {', '.join(unsupported)}"
+                        result["message"] = (
+                            f"{result['message']}；{note}" if result.get("message") else note
+                        )
                 return result
 
             return asyncio.create_task(_send())
