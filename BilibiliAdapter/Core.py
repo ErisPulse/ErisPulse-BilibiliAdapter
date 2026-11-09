@@ -15,7 +15,7 @@ try:
 except ImportError:  # pragma: no cover
     spawn_background = None
 
-__version__ = "0.2.1"
+__version__ = "0.3.1"
 
 MIN_FRAMEWORK_VERSION = (2, 7, 1)
 
@@ -57,6 +57,82 @@ def _check_framework_version() -> bool:
 
 from bilibili_api import session as bili_session
 from bilibili_api.utils.network import Credential
+
+_EM_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _clean_text(value) -> str:
+    """搜索结果标题带 <em class="keyword"> 高亮标签，去标签留原文。"""
+    return _EM_TAG_RE.sub("", str(value or "")).strip()
+
+
+def _simplify_dynamics(data: dict) -> list:
+    """动态列表归一化：图文/视频/转发都提炼成 {type,title/url/desc,author}。"""
+    out = []
+    for item in (data or {}).get("items") or []:
+        modules = item.get("modules") or {}
+        author = str(((modules.get("module_author") or {}).get("name")) or "")
+        dynamic = modules.get("module_dynamic") or {}
+        desc = str(((dynamic.get("desc") or {}).get("text")) or "").strip()
+        major = dynamic.get("major") or {}
+        archive = major.get("archive") or {}
+        if archive:
+            bvid = str(archive.get("bvid") or "")
+            out.append({
+                "type": "video",
+                "title": _clean_text(archive.get("title")),
+                "bvid": bvid,
+                "url": f"https://www.bilibili.com/video/{bvid}" if bvid else "",
+                "desc": _clean_text(archive.get("desc") or desc)[:300],
+                "author": author,
+            })
+        elif desc:
+            out.append({"type": "text", "text": desc[:300], "author": author})
+    return out
+
+
+def _simplify_search(data: dict) -> list:
+    out = []
+    for item in (data or {}).get("result") or []:
+        bvid = str(item.get("bvid") or "")
+        out.append({
+            "title": _clean_text(item.get("title")),
+            "url": str(item.get("arcurl") or (f"https://www.bilibili.com/video/{bvid}" if bvid else "")),
+            "bvid": bvid,
+            "author": str(item.get("author") or ""),
+            "play": item.get("play"),
+            "danmaku": item.get("danmaku"),
+            "description": _clean_text(item.get("description"))[:200],
+        })
+    return out
+
+
+def _simplify_popular(data: dict) -> list:
+    items = (data or {}).get("list") or []
+    out = []
+    for item in items:
+        bvid = str(item.get("bvid") or "")
+        owner = item.get("owner") or {}
+        stat = item.get("stat") or {}
+        out.append({
+            "title": _clean_text(item.get("title")),
+            "bvid": bvid,
+            "url": f"https://www.bilibili.com/video/{bvid}" if bvid else "",
+            "author": str(owner.get("name") or ""),
+            "view": stat.get("view"),
+            "danmaku": stat.get("danmaku"),
+            "desc": _clean_text(item.get("desc"))[:200],
+        })
+    return out
+
+
+def _bili_error_code(e: Exception) -> int:
+    """bilibili_api 异常归类：网络类 33001，平台类 34100"""
+    try:
+        from bilibili_api.exceptions import NetworkException
+        return 33001 if isinstance(e, NetworkException) else 34100
+    except Exception:
+        return 34100
 
 
 def _forward_node_text(node: Dict) -> str:
@@ -349,6 +425,7 @@ class BilibiliAdapter(BaseAdapter):
             }
             ev = {
                 "id": str(uuid.uuid4()),
+                "message_id": str(data.get("msg_key") or ""),
                 "time": int(_time.time()),
                 "type": "message",
                 "detail_type": "private",
@@ -369,7 +446,9 @@ class BilibiliAdapter(BaseAdapter):
 
     async def call_api(self, endpoint: str, _account_id: Optional[str] = None, **params):
         """API 动作统一入口（send_message / get_self_info 等）"""
-        rt = self._runtimes.get(_account_id) if _account_id else next(iter(self._runtimes.values()), None)
+        # 标准字段 account_id 与旧名 _account_id 双兼容（ApiDSL.Using 传标准名）
+        account_id = params.pop("account_id", None) or _account_id
+        rt = self._runtimes.get(account_id) if account_id else next(iter(self._runtimes.values()), None)
         if rt is None:
             return self.make_error(retcode=10003, message="账户不存在或未启动")
         if endpoint == "send_message":
@@ -389,6 +468,46 @@ class BilibiliAdapter(BaseAdapter):
         if endpoint == "get_self_info":
             info = await bili_session.get_self_info(rt.credential)
             return self.make_response(data=info, raw=info)
+# ===== 内容浏览（供 QvQChat call_adapter_api / 生态模块使用）=====
+        if endpoint == "get_user_dynamics":
+            uid = str(params.get("uid") or "").strip()
+            if not uid.isdigit():
+                return self.make_error(retcode=10003, message="缺少有效的 uid")
+            try:
+                from bilibili_api import user as bili_user
+
+                data = await bili_user.User(int(uid)).get_dynamics(
+                    offset=int(params.get("offset") or 0)
+                )
+                items = _simplify_dynamics(data)
+                return self.make_response(data={"uid": uid, "items": items, "count": len(items)})
+            except Exception as e:
+                return self.make_error(retcode=_bili_error_code(e), message=f"获取动态失败: {e}")
+        if endpoint == "search_video":
+            keyword = str(params.get("keyword") or "").strip()
+            if not keyword:
+                return self.make_error(retcode=10003, message="缺少 keyword")
+            try:
+                from bilibili_api import search as bili_search
+
+                data = await bili_search.search_by_type(
+                    keyword,
+                    search_type=bili_search.SearchObjectType.VIDEO,
+                    page=max(1, int(params.get("page") or 1)),
+                )
+                items = _simplify_search(data)
+                return self.make_response(data={"keyword": keyword, "items": items, "count": len(items)})
+            except Exception as e:
+                return self.make_error(retcode=_bili_error_code(e), message=f"搜索失败: {e}")
+        if endpoint == "get_popular":
+            try:
+                from bilibili_api import homepage as bili_homepage
+
+                data = await bili_homepage.get_popularize()
+                items = _simplify_popular(data)
+                return self.make_response(data={"items": items, "count": len(items)})
+            except Exception as e:
+                return self.make_error(retcode=_bili_error_code(e), message=f"获取热门失败: {e}")
         return self.make_error(retcode=10002, message=f"不支持的动作: {endpoint}")
 
     async def shutdown(self):
@@ -576,13 +695,15 @@ class BilibiliAdapter(BaseAdapter):
         """Bilibili 标准 API 动作"""
 
         async def get_self_info(self) -> dict:
-            rt = self._adapter._current_runtime()
+            rt = self._adapter._current_runtime(self._account_id or self.api_context.get("account_id"))
             info = await bili_session.get_self_info(rt.credential)
             data = info or {}
             return self._adapter.make_response(
                 data={
                     "user_id": str(data.get("mid", "")),
                     "user_name": data.get("name", ""),
+                    "user_displayname": data.get("name", ""),
+                    "user_remark": "",
                     "avatar": data.get("face", ""),
                 },
                 raw=info,
@@ -594,24 +715,28 @@ class BilibiliAdapter(BaseAdapter):
         async def get_version(self) -> dict:
             from . import __version__
 
-            return self._adapter.make_response(data={"version": __version__})
+            return self._adapter.make_response(
+                data={
+                    "impl": "ErisPulse-BilibiliAdapter",
+                    "version": __version__,
+                    "onebot_version": "12",
+                }
+            )
 
         async def get_supported_actions(self) -> dict:
             return self._adapter.make_response(
-                data={
-                    "actions": [
-                        "get_self_info", "get_status", "get_version",
-                        "get_supported_actions", "send_message",
-                        "get_user_info", "get_session_msgs",
-                    ]
-                }
+                data=[
+                    "get_self_info", "get_status", "get_version",
+                    "get_supported_actions", "send_message",
+                    "get_user_info", "get_session_msgs",
+                ]
             )
 
         async def get_user_info(self, user_id: str) -> dict:
             """获取用户公开信息（昵称/头像）"""
             from bilibili_api import user as bili_user
 
-            rt = self._adapter._current_runtime()
+            rt = self._adapter._current_runtime(self._account_id or self.api_context.get("account_id"))
             u = bili_user.User(int(user_id), credential=rt.credential)
             info = await u.get_info()
             data = info or {}
@@ -619,6 +744,8 @@ class BilibiliAdapter(BaseAdapter):
                 data={
                     "user_id": str(data.get("mid", user_id)),
                     "user_name": data.get("name", ""),
+                    "user_displayname": data.get("name", ""),
+                    "user_remark": "",
                     "avatar": data.get("face", ""),
                 },
                 raw=info,
@@ -626,14 +753,15 @@ class BilibiliAdapter(BaseAdapter):
 
         async def get_session_msgs(self, talker_id: str, begin_seqno: int = 0) -> dict:
             """拉取指定会话的历史消息"""
-            rt = self._adapter._current_runtime()
+            rt = self._adapter._current_runtime(self._account_id or self.api_context.get("account_id"))
             result = await bili_session.fetch_session_msgs(
                 int(talker_id), rt.credential, begin_seqno=begin_seqno
             )
             return self._adapter.make_response(data=result, raw=result)
 
-    def _current_runtime(self):
-        name = getattr(self, "_api_account_id", None)
+    def _current_runtime(self, account_id: Optional[str] = None):
+        # 显式 Using() / 事件链路账户优先（ApiDSL.api_context 兜底），失效时回退首个账户
+        name = account_id or getattr(self, "_api_account_id", None)
         if name and name in self._runtimes:
             return self._runtimes[name]
         return next(iter(self._runtimes.values()))

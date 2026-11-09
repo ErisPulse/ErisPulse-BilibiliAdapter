@@ -14,14 +14,16 @@ import json
 import time
 import uuid
 
+from ErisPulse.Core.Bases import BaseConverter
+
 __all__ = ["BilibiliConverter"]
 
 
-class BilibiliConverter:
+class BilibiliConverter(BaseConverter):
     """B 站私信事件转换器"""
 
     def __init__(self, platform: str = "bilibili"):
-        self.platform = platform
+        super().__init__(platform)
 
     def convert(self, raw_event: dict, *, bot_id: str = "",
                 user_name: str = "", account_id: str = "") -> dict | None:
@@ -54,19 +56,16 @@ class BilibiliConverter:
         if user_name:
             self_info["user_name"] = user_name
 
-        event = {
-            "id": str(raw_event.get("msg_key") or uuid.uuid4()),
-            "time": self._normalize_timestamp(raw_event.get("timestamp")),
-            "type": "message",
-            "detail_type": "private",
-            "platform": self.platform,
-            "self": self_info,
-            "user_id": sender_uid,
-            "message": segments,
-            "alt_message": " ".join(alt_parts),
-            "bilibili_raw": raw_event,
-            "bilibili_raw_type": raw_type,
-        }
+        event = self.build_base_event(raw_event, raw_type)
+        event["id"] = str(raw_event.get("msg_key") or uuid.uuid4())
+        event["time"] = self._normalize_timestamp(raw_event.get("timestamp"))
+        event["type"] = "message"
+        event["detail_type"] = "private"
+        event["self"] = self_info
+        event["user_id"] = sender_uid
+        event["message"] = segments
+        event["alt_message"] = " ".join(alt_parts)
+        event["message_id"] = str(raw_event.get("msg_key") or "")
         nickname = str(raw_event.get("sender_name") or "")
         if nickname:
             event["user_nickname"] = nickname
